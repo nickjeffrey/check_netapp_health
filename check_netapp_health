@@ -1,0 +1,364 @@
+#!/usr/bin/perl -w
+
+
+# DESCRIPTION
+# -----------
+#  This script is a nagios check that determines the health status of a NetApp ONTAP storage system via SNMP
+
+
+
+# CHANGE LOG
+# ----------
+#  2022/05/09 	njeffrey 	Script created
+
+
+
+
+# NOTES
+# -----
+#
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#   define service{
+#           #syntax is check_netapp_health!SNMP_community_name
+#           use                             generic-service
+#           host_name                       netapp01
+#           service_description             Netapp health check
+#           check_command                   check_netapp_health!public
+#           }
+#
+#  You will need a section in the commands.cfg
+#  file on the nagios server that looks similar to the following.
+#     # ---------------------------------------------------------------------------
+#     # 'check_netapp_health' command definition
+#     define command{
+#             command_name    check_netapp_health
+#             command_line    $USER1$/check_netapp_health -H $HOSTADDRESS$ -C $ARG1$
+#             }
+#
+#
+#
+
+
+use strict;					#enforce good coding practices
+use Getopt::Long;                       	#allow --long-switches to be used as parameters
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$host,$community,$community_default,$serial,$ontap_version,$miscGlobalStatus);
+my ($pingstatus,$snmpwalk,$snmpget,$cmd,$sysdescr,$common_output);
+my ($opt_C,$opt_h,$opt_H,$opt_v);
+my ($verbose,$oid);
+$community_default="public";			#use this value if user does not specify SNMP community string
+$CHECK_NAME= "Netapp health";
+$verbose = "no";				#for debugging
+
+
+
+#
+# Nagios return codes
+#
+$OK       = 0;
+$WARN     = 1;
+$CRITICAL = 2;
+$UNKNOWN  = 3;
+
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, 
+      "H=s" => \$opt_H, "host=s"      => \$opt_H, 
+   );
+   #
+   # If the user did not supply a --community= value, use the default.
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = $community_default;
+   }
+   #
+   # If the user did not supply a -H or --host== value, generate a warning.
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME Unknown - cannot determine remote host.  Usage: $0 -H host -c community \n";
+      exit $UNKNOWN;				#exit script
+   }
+   #
+   #
+   # see if user provided -v or --verbose switch
+   if ( defined($opt_v) ) {  
+      $verbose = "yes";
+      print "   host=$host community=$community \n" if ($verbose eq "yes");
+   } 							#end of if block
+}                       #end of subroutine
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # Confirm required files exist 
+   # 
+   $snmpget = "/usr/local/bin/snmpget        -On -r 2 -t 5 -v 1 -c $community    $host"   if ( -e "/usr/local/bin/snmpget" );
+   $snmpget = "/usr/bin/snmpget              -On -r 2 -t 5 -v 1 -c $community    $host"   if ( -e "/usr/bin/snmpget" );
+   #
+   $snmpwalk = "/usr/local/bin/snmpwalk      -On -r 2 -t 5 -v 1 -c $community    $host"   if ( -e "/usr/local/bin/snmpget" );
+   $snmpwalk = "/usr/bin/snmpwalk            -On -r 2 -t 5 -v 1 -c $community    $host"   if ( -e "/usr/bin/snmpget" );
+   #
+   #
+   # confirm a remote host is defined
+   if( ! defined( $host ) ) {
+      print "$CHECK_NAME Unknown - missing name of remote host to check.  Use $0 -h for help\n";
+      exit $UNKNOWN;                                    #exit script
+   }
+   #
+   #
+   #
+   # Confirm the remote host is up
+   #
+   print "   trying to ping $host \n" if ($verbose eq "yes");
+   open(IN,"ping -c 1 -w 1 $host 2>&1 |");     	#send a single ping to the remote host and wait 1 second for a reply
+   while (<IN>) {                               #read a line from STDIN
+      if ( /100% packet loss/ ) {               #check for ping timeouts (indicates host may be down)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- no ping reply from $host \n";
+         print $pingstatus;                     #print error message
+         exit $UNKNOWN;                         #exit script
+      }                                         #end of if block
+      if ( /NOT FOUND/ ) {                      #check for invalid hostname (using AIX ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host \n";
+         print $pingstatus;                     #print error message
+         exit $UNKNOWN;                         #exit script
+      }                                         #end of if block
+      if ( /unknown host/ ) {                   #check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host \n";
+         print $pingstatus;                     #print error message
+         exit $UNKNOWN;                         #exit script
+      }                                         #end of if block
+      if ( /no route to host/ ) {               #check for routing problems
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not find a route to $host - check routing tables \n";
+         print $pingstatus;                     #print error message
+         exit $UNKNOWN;                         #exit script
+      }                                         #end of if block
+   }                                            #end of while loop
+   close IN;                                    #close filehandle
+}						#end of subroutine
+
+
+
+
+
+sub get_usage {
+   #
+   # this subroutine gets called if user enters -h or --help parameters
+   print "running get_usage subroutine \n" if ($verbose eq "yes");
+   #
+   if( $opt_h ) {
+      print "Nagios plugin for determining health of Netapp ONTAP storage system \n";
+      print "$0 [options]  \n";
+      print "    where options are: \n";
+      print "    -c --community=SNMP_community_string     (default=public)\n";
+      print "    -h --help \n";
+      print "    -H --host=IP|hostname \n";
+      print "    -v --verbose \n";
+      print "\n\n";
+      exit;
+   }                                            #end of if block
+}						#end of subroutine
+
+
+
+
+
+sub confirm_snmp_working {
+   #
+   # This section confirms the remote host will respond to SNMP queries
+   #
+   print "Running confirm_snmp_working subroutine \n" if ($verbose eq "yes");
+   # Get the system description via SNMP
+   # SNMPv2-MIB::sysDescr.0
+   #
+   $sysdescr = "";				#initialize variable
+   $oid = ".1.3.6.1.2.1.1.1.0";
+   $cmd = "$snmpget $oid 2>&1"; 		#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |"); 		#open a filehandle for reading 
+   while (<IN>) {                          	#read a line from STDIN
+      if ( /STRING: ([a-zA-Z0-9\.]+)/ ) {  	#look for a response to the snmp query
+         $sysdescr = $1;			#assign more mnemonic variable name
+      } 					#end of if block
+   }						#end of while loop
+   close IN;					#close filehandle
+   unless ( $sysdescr =~ /[a-zA-Z0-9\.]+/ ) {
+      print "$CHECK_NAME CRITICAL -- could not query $host via SNMP.  Confirm you have the correct SNMP community string and the remote host $host has a working SNMP daemon.\n";
+      exit $UNKNOWN;				#exit script 
+   }						#end of unless block
+}						#end of subroutine
+
+
+
+
+sub get_model_serial {
+   #
+   # figure out what kind of NetApp storage system we are dealing with
+   #
+   # $ snmpwalk -v 1 -c public netappfiler01   1.3.6.1.4.1.789.1.1.9.0
+   # SNMPv2-SMI::enterprises.789.1.1.9.0 = STRING: "1-80-000099"
+   #
+   # Get model number
+   #  <not sure of OID)
+   #
+   #  Get serial number
+   #
+   print "running get_model_serial subroutine \n" if ($verbose eq "yes");
+   $serial = "unknown";							#initialize variable 
+   $oid = "1.3.6.1.4.1.789.1.1.9.0"; 
+   $cmd = "$snmpget $oid 2>&1";						#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |"); 							#open a filehandle for reading 
+   while (<IN>) {                          				#read a line from STDIN
+      s/"//g;								#get rid of quotation marks to make the regex eaier
+      if ( /STRING: ([0-9a-zA-Z_\.\-]+)/ ) {  				#look for a response to the snmp query
+         $serial = $1;							#assign more mnemonic variable name
+         print "   serial_number:$serial \n" if ($verbose eq "yes");
+      } 								#end of if block
+   }									#end of while loop
+   close IN;								#close filehandle
+   #
+   #
+   # confirm we got a valid serial number
+   if ( $serial =~ /Timeout/ ) {					#look for specific error
+      print "$CHECK_NAME Unknown - SNMP request timed out.  Check SNMP community string.\n";
+      exit $UNKNOWN;							#exit script
+   }									#end of if block
+}									#end of subroutine
+
+
+
+sub get_status {
+   #
+   print "running get_status subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # 1.3.6.1.4.1.789.1.2.2.4.0 miscGlobalStatus 1=other 2=unknown 3=ok 4=nonCritical 5=critical 6=nonRecoverable
+   # This indicates the overall status of the appliance.  The algorithm to determine the value uses both
+   # hardware status (e.g. the number of failed fans) and volume status (e.g. number of volumes that are full).
+   # The algorithm is subject to change in future releases, but the range of values will not change.
+   # 
+   # Sample output: $ snmpget -v 1 -c public netapp01 .1.3.6.1.4.1.789.1.2.2.4.0
+   # SNMPv2-SMI::enterprises.789.1.2.2.4.0 = INTEGER: 3                <--  1=other 2=unknown 3=ok 4=nonCritical 5=critical 6=nonRecoverable
+   #
+   #
+
+   $miscGlobalStatus = "Unknown";               #initialize variable
+   $oid = ".1.3.6.1.4.1.789.1.2.2.4.0"; 
+   $cmd = "$snmpget $oid 2>&1";			#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |"); 				#open a filehandle for reading 
+   while (<IN>) {                          	#read a line from STDIN
+      if ( /INTEGER: ([0-9]+)/ ) {  		#look for a response to the snmp query
+         $miscGlobalStatus = $1;		#assign more mnemonic variable name
+         print "   status is $miscGlobalStatus  (1=other 2=unknown 3=ok 4=nonCritical 5=critical 6=nonRecoverable) \n" if ($verbose eq "yes");
+         $miscGlobalStatus = $1;                                         #value for GlobalSystemStatus
+         $miscGlobalStatus = "Other"          if ( $miscGlobalStatus eq "1" );   #convert integer to human readable text
+         $miscGlobalStatus = "Unknown"        if ( $miscGlobalStatus eq "2" );   #convert integer to human readable text
+         $miscGlobalStatus = "OK"             if ( $miscGlobalStatus eq "3" );   #convert integer to human readable text
+         $miscGlobalStatus = "nonCritical"    if ( $miscGlobalStatus eq "4" );   #convert integer to human readable text
+         $miscGlobalStatus = "Critical"       if ( $miscGlobalStatus eq "5" );   #convert integer to human readable text
+         $miscGlobalStatus = "nonRecoverable" if ( $miscGlobalStatus eq "6" );   #convert integer to human readable text
+
+      } 					#end of if block
+   }						#end of while loop
+   close IN;					#close filehandle
+}									#end of subroutine
+
+
+
+
+
+
+
+
+sub get_ontap_version {
+   #
+   print "running get_ontap_version subroutine \n" if ($verbose eq "yes");
+   #
+   #  $ snmpwalk -v 1 -c public netappfiler01   1.3.6.1.4.1.789.1.1.6.0   <---  shows the ONTAP version on the first controller
+   #  SNMPv2-SMI::enterprises.789.1.1.6.0 = STRING: "9.8"
+   #  
+   $ontap_version = "unknown";				#initialize variable 
+   $oid = ".1.3.6.1.4.1.789.1.1.6.0"; 
+   $cmd = "$snmpget $oid 2>&1";			#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |"); 				#open a filehandle for reading 
+   while (<IN>) {                          	#read a line from STDIN
+      s/"//g;					#get rid of quotation marks to make the regex eaier
+      if ( /STRING: ([0-9a-zA-Z_\.]+)/ ) {  	#look for a response to the snmp query
+         $ontap_version = $1;			#assign to variable
+      } 					#end of if block
+   }						#end of while loop
+   close IN;					#close filehandle
+   print "   ontap_version is $ontap_version \n" if ($verbose eq "yes");
+}									#end of subroutine
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   $common_output = "GlobalStatus:$miscGlobalStatus serial_number:$serial ONTAP_version:$ontap_version ";
+   if ( $miscGlobalStatus eq "OK" )  {
+       print "$CHECK_NAME OK - $common_output \n";
+       exit $OK;
+   }
+   if ( $miscGlobalStatus ne "OK" )  {
+       print "$CHECK_NAME WARN - $common_output \n";
+       exit $WARN;
+   }
+}			#end of subroutine
+
+
+
+
+
+
+# ----------------------- main body of program -------------------------------
+get_options;
+sanity_checks;
+get_usage;
+confirm_snmp_working;
+get_model_serial;
+get_status;
+get_ontap_version;
+print_output;
+
+
+
