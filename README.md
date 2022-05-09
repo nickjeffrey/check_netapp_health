@@ -17,7 +17,7 @@ You will need a section in the services.cfg file on the nagios server that looks
 ```
 You will also need a command definition similar to the following in commands.cfg on the nagios server
 ```
-    # 'check_netappe_health' command definition
+    # 'check_netapp_health' command definition
     define command{
        command_name    check_netapp_health
        command_line    $USER1$/check_netapp_health -H $HOSTADDRESS$ -C $ARG1$
